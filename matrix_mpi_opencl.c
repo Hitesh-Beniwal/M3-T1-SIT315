@@ -1,36 +1,30 @@
-#define CL_TARGET_OPENCL_VERSION 120  // Fix for OpenCL version
+#define CL_TARGET_OPENCL_VERSION 210
 #include <mpi.h>
 #include <CL/cl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 
-#define N 512
-#define CL_CHECK(err) if (err != CL_SUCCESS) { printf("OpenCL error %d\n", err); exit(1); }
-
-const char *kernelSource =
-"__kernel void mat_mul(__global float* A, __global float* B, __global float* C, int N, int rows) {\n"
-"  int i = get_global_id(0);\n"
-"  int j = get_global_id(1);\n"
-"  if (i < rows && j < N) {\n"
-"    float sum = 0.0f;\n"
-"    for (int k = 0; k < N; ++k) {\n"
-"      sum += A[i*N + k] * B[k*N + j];\n"
-"    }\n"
-"    C[i*N + j] = sum;\n"
-"  }\n"
-"}\n";
-
-void fillMatrix(float *matrix, int size) {
-    for (int i = 0; i < size * size; i++) {
-        matrix[i] = rand() % 100;
+// Utility to read OpenCL kernel source file
+const char* read_kernel(const char* filename) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        perror("Failed to load kernel");
+        exit(1);
     }
+    fseek(fp, 0, SEEK_END);
+    size_t size = ftell(fp);
+    rewind(fp);
+    char* source = (char*)malloc(size + 1);
+    fread(source, 1, size, fp);
+    source[size] = '\0';
+    fclose(fp);
+    return source;
 }
 
 int main(int argc, char** argv) {
+    const int N = 1024;
+    float A[N * N], B[N * N], C[N * N];
     int rank, size;
-    float *A = NULL, *B = NULL, *C = NULL;
-    float *local_A, *local_C;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -38,72 +32,72 @@ int main(int argc, char** argv) {
 
     int rows = N / size;
 
-    local_A = (float*)malloc(sizeof(float) * rows * N);
-    local_C = (float*)malloc(sizeof(float) * rows * N);
-    B = (float*)malloc(sizeof(float) * N * N);
-
     if (rank == 0) {
-        A = (float*)malloc(sizeof(float) * N * N);
-        C = (float*)malloc(sizeof(float) * N * N);
-        srand(time(0));
-        fillMatrix(A, N);
-        fillMatrix(B, N);
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j) {
+                A[i * N + j] = i + j;
+                B[i * N + j] = i - j;
+            }
     }
 
-    double start = MPI_Wtime();
+    float* A_sub = (float*)malloc(rows * N * sizeof(float));
+    float* C_sub = (float*)malloc(rows * N * sizeof(float));
 
     MPI_Bcast(B, N * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Scatter(A, rows * N, MPI_FLOAT, local_A, rows * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Scatter(A, rows * N, MPI_FLOAT, A_sub, rows * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    // OpenCL Setup
+    // --------- OpenCL Setup ---------
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
     cl_command_queue queue;
     cl_program program;
     cl_kernel kernel;
-    cl_mem bufA, bufB, bufC;
     cl_int err;
 
-    cl_uint uintN = N;
-    cl_uint uintRows = rows;
+    cl_mem bufA, bufB, bufC;
 
-    CL_CHECK(clGetPlatformIDs(1, &platform, NULL));
-    CL_CHECK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_DEFAULT, 1, &device, NULL));
+    clGetPlatformIDs(1, &platform, NULL);
+    clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &device, NULL);
 
-    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err); CL_CHECK(err);
-    queue = clCreateCommandQueue(context, device, 0, &err); CL_CHECK(err);
+    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    cl_queue_properties props[] = { 0 };
+    queue = clCreateCommandQueueWithProperties(context, device, props, &err);
 
-    bufA = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * rows * N, local_A, &err); CL_CHECK(err);
-    bufB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * N * N, B, &err); CL_CHECK(err);
-    bufC = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * rows * N, NULL, &err); CL_CHECK(err);
+    const char* src = read_kernel("matrix_mul.cl");
+    program = clCreateProgramWithSource(context, 1, &src, NULL, &err);
+    clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    kernel = clCreateKernel(program, "matrix_mul", &err);
 
-    program = clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err); CL_CHECK(err);
-    CL_CHECK(clBuildProgram(program, 1, &device, NULL, NULL, NULL));
-    kernel = clCreateKernel(program, "mat_mul", &err); CL_CHECK(err);
+    bufA = clCreateBuffer(context, CL_MEM_READ_ONLY, rows * N * sizeof(float), NULL, &err);
+    bufB = clCreateBuffer(context, CL_MEM_READ_ONLY, N * N * sizeof(float), NULL, &err);
+    bufC = clCreateBuffer(context, CL_MEM_WRITE_ONLY, rows * N * sizeof(float), NULL, &err);
 
-    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufA));
-    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &bufB));
-    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &bufC));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &uintN));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &uintRows));
+    clEnqueueWriteBuffer(queue, bufA, CL_TRUE, 0, rows * N * sizeof(float), A_sub, 0, NULL, NULL);
+    clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, N * N * sizeof(float), B, 0, NULL, NULL);
 
-    size_t global[2] = {rows, N};
-    CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, NULL, 0, NULL, NULL));
-    CL_CHECK(clFinish(queue));
-    CL_CHECK(clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, sizeof(float) * rows * N, local_C, 0, NULL, NULL));
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufA);
+    clSetKernelArg(kernel, 1, sizeof(cl_mem), &bufB);
+    clSetKernelArg(kernel, 2, sizeof(cl_mem), &bufC);
+    clSetKernelArg(kernel, 3, sizeof(int), &N);
 
-    MPI_Gather(local_C, rows * N, MPI_FLOAT, C, rows * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    size_t global[2] = { rows, N };
+    clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, NULL, 0, NULL, NULL);
+    clFinish(queue);
 
-    double end = MPI_Wtime();
+    clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, rows * N * sizeof(float), C_sub, 0, NULL, NULL);
+
+    // Gather final result
+    MPI_Gather(C_sub, rows * N, MPI_FLOAT, C, rows * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("MPI + OpenCL time: %f seconds\n", end - start);
-        free(A); free(C);
+        printf(" MPI + OpenCL matrix multiplication complete.\n");
     }
 
-    free(B); free(local_A); free(local_C);
-
+    // Cleanup
+    free((void*)src);
+    free(A_sub);
+    free(C_sub);
     clReleaseMemObject(bufA);
     clReleaseMemObject(bufB);
     clReleaseMemObject(bufC);
