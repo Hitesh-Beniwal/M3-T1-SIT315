@@ -1,4 +1,4 @@
-// matrix_mpi_opencl.c
+#define CL_TARGET_OPENCL_VERSION 120  // Fix for OpenCL version
 #include <mpi.h>
 #include <CL/cl.h>
 #include <stdio.h>
@@ -8,7 +8,7 @@
 #define N 512
 #define CL_CHECK(err) if (err != CL_SUCCESS) { printf("OpenCL error %d\n", err); exit(1); }
 
-const char *kernelSource = 
+const char *kernelSource =
 "__kernel void mat_mul(__global float* A, __global float* B, __global float* C, int N, int rows) {\n"
 "  int i = get_global_id(0);\n"
 "  int j = get_global_id(1);\n"
@@ -65,8 +65,12 @@ int main(int argc, char** argv) {
     cl_mem bufA, bufB, bufC;
     cl_int err;
 
+    cl_uint uintN = N;
+    cl_uint uintRows = rows;
+
     CL_CHECK(clGetPlatformIDs(1, &platform, NULL));
     CL_CHECK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_DEFAULT, 1, &device, NULL));
+
     context = clCreateContext(NULL, 1, &device, NULL, NULL, &err); CL_CHECK(err);
     queue = clCreateCommandQueue(context, device, 0, &err); CL_CHECK(err);
 
@@ -81,13 +85,12 @@ int main(int argc, char** argv) {
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufA));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &bufB));
     CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &bufC));
-    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(int), &N));
-    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int), &rows));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_uint), &uintN));
+    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_uint), &uintRows));
 
     size_t global[2] = {rows, N};
     CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, NULL, 0, NULL, NULL));
     CL_CHECK(clFinish(queue));
-
     CL_CHECK(clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, sizeof(float) * rows * N, local_C, 0, NULL, NULL));
 
     MPI_Gather(local_C, rows * N, MPI_FLOAT, C, rows * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
